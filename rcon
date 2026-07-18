@@ -1,0 +1,1073 @@
+#!/bin/bash
+#
+# rcon - Full recon workflow, mendukung 2 mode scan:
+#
+#   SCAN_MODE=wildcard (default) : targets.txt isi ROOT DOMAIN, full enum
+#                                  (subfinder+amass+crt.sh+permutation+resolve)
+#                                  -> excludes.txt OPSIONAL, buat filter subdomain out-of-scope
+#
+#   SCAN_MODE=targeted           : targets.txt isi SUBDOMAIN/HOST SPESIFIK yang mau di-scan
+#                                  langsung (skip enum & permutation sepenuhnya)
+#                                  -> excludes.txt OPSIONAL, biasanya gak perlu krn udah presisi
+#
+# Usage:
+#   SCAN_MODE=wildcard  ./rcon targets.txt [excludes.txt]
+#   SCAN_MODE=targeted  ./rcon targets.txt [excludes.txt]
+#
+# Env override (opsional):
+#   SCAN_MODE               - wildcard | targeted (default: wildcard)
+#   EXTRA_PORTS              - daftar port httpx
+#   HTTPX_RATE               - rate limit httpx (default: 150)
+#   HTTPX_THREADS            - jumlah thread httpx (default: 50)
+#   DNSX_THREADS             - jumlah thread dnsx (default: 100)
+#   KATANA_HEADLESS_LIMIT    - maks jumlah host yang di-headless-crawl (default: 20)
+#
+# CATATAN: dnsx & katana TIDAK dibatasi waktu keseluruhan (bakal jalan sampai tuntas).
+#          Per-request timeout tetap aktif (dnsx: 5s, katana static: 10s, headless: 15s)
+#          supaya SATU item yang nyangkut gak bikin SELURUH proses hang selamanya.
+#
+set -uo pipefail
+
+print_usage() {
+cat << 'USAGE_EOF'
+rcon - Full recon workflow (subdomain enum -> resolve -> live check -> URL mining -> screenshot)
+
+USAGE:
+  ./rcon [-h|--help] [--log|-L <file>] [targets.txt] [excludes.txt]
+
+FLAG:
+  -h, --help              Tampilkan bantuan ini
+  --log, --log-file, -L, -l <file>
+                          Simpan SEMUA output (stdout+stderr) ke <file> juga (via tee),
+                          selain tetap tampil di terminal. Kalau flag ini TIDAK dipakai,
+                          log cuma tampil di terminal seperti biasa (gak disimpan otomatis).
+                          Berguna kalau log kepanjangan & scrollback terminal kepotong —
+                          buka file log-nya pakai 'tail -f <file>' atau 'less +F <file>'
+                          dari terminal lain, bisa scroll/cari bebas tanpa batas.
+
+ARGUMEN POSISI:
+  targets.txt    (opsional, default: targets.txt)
+                 - Mode wildcard : isi ROOT DOMAIN (contoh: nubank.com.br)
+                 - Mode targeted : isi SUBDOMAIN/HOST SPESIFIK (contoh: app.nubank.com.br)
+  excludes.txt   (opsional, default: excludes.txt)
+                 - Pattern (substring) yang mau di-exclude dari hasil enum, 1 per baris
+                 - Kalau file tidak ada/kosong, semua hasil enum diproses (tidak ada yg di-exclude)
+
+MODE SCAN (via env var SCAN_MODE):
+  SCAN_MODE=wildcard   (default) Full enum: subfinder+amass+crt.sh+permutation+resolve
+  SCAN_MODE=targeted   Skip enum & permutation, langsung scan host yang ada di targets.txt
+
+ENV VAR OPSIONAL LAINNYA:
+  EXTRA_PORTS            Daftar port httpx, comma-separated (default: list panjang port umum)
+  HTTPX_RATE             Rate limit httpx, request/detik (default: 150)
+  HTTPX_THREADS          Jumlah thread httpx (default: 50)
+  DNSX_THREADS           Jumlah thread dnsx (default: 100)
+  KATANA_HEADLESS_LIMIT  Maks jumlah host yang di-headless-crawl (default: 20)
+
+CATATAN WAKTU:
+  dnsx & katana TIDAK dibatasi waktu keseluruhan (jalan sampai tuntas).
+  Per-request timeout tetap aktif (dnsx: 5s, katana static: 10s, headless: 15s)
+  supaya SATU item yang nyangkut gak bikin SELURUH proses hang selamanya.
+
+CONTOH:
+  # Wildcard + exclude list
+  SCAN_MODE=wildcard ./rcon targets.txt excludes.txt
+
+  # Wildcard tanpa exclude
+  SCAN_MODE=wildcard ./rcon targets.txt
+
+  # Targeted (host spesifik, skip enum)
+  SCAN_MODE=targeted ./rcon targets_specific.txt
+
+  # Custom port + rate limit lebih pelan
+  HTTPX_RATE=50 EXTRA_PORTS="80,443,8443" ./rcon targets.txt excludes.txt
+
+  # Simpan log ke file (biar bisa di-tail/less dari terminal lain, gak kepotong scrollback)
+  ./rcon --log recon_run.log targets.txt excludes.txt
+
+OUTPUT:
+  Semua hasil disimpan di folder recon_<timestamp>/, termasuk report.md
+  yang berisi ringkasan angka + host paling menarik utk direview duluan.
+USAGE_EOF
+}
+
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        print_usage
+        exit 0
+    fi
+done
+
+# ---------- ARGUMENT PARSING (support flag --log/-L, sisanya positional) ----------
+LOG_FILE=""
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --log|--log-file|-L|-l)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: $1 butuh argumen path file, contoh: $1 output.log"
+                exit 1
+            fi
+            LOG_FILE="$2"
+            shift 2
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]:-}"
+
+TARGET_FILE="${1:-targets.txt}"
+EXCLUDE_FILE="${2:-excludes.txt}"
+SCAN_MODE="${SCAN_MODE:-wildcard}"
+OUTDIR="recon_$(date +%Y%m%d_%H%M%S)"
+GOBIN="${GOPATH:-$HOME/go}/bin"
+export PATH="$PATH:$GOBIN"
+
+RESOLVERS_URL="${RESOLVERS_URL:-https://raw.githubusercontent.com/trickest/resolvers/main/resolvers-trusted.txt}"
+HTTPX_RATE="${HTTPX_RATE:-150}"
+HTTPX_THREADS="${HTTPX_THREADS:-50}"
+DNSX_THREADS="${DNSX_THREADS:-100}"
+KATANA_HEADLESS_LIMIT="${KATANA_HEADLESS_LIMIT:-20}"
+
+if [[ "$SCAN_MODE" != "wildcard" && "$SCAN_MODE" != "targeted" ]]; then
+    echo "SCAN_MODE harus 'wildcard' atau 'targeted', bukan '$SCAN_MODE'"
+    exit 1
+fi
+
+# ---------- TIMESTAMP & PROGRESS TRACKING ----------
+SCRIPT_START_EPOCH=$(date +%s)
+CURRENT_STAGE=0
+TOTAL_STAGES=10
+LAST_STAGE_START=$SCRIPT_START_EPOCH
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+fmt_duration() {
+    local total="$1"
+    printf '%02dh:%02dm:%02ds' $((total/3600)) $(((total%3600)/60)) $((total%60))
+}
+
+elapsed_since_start() {
+    local now; now=$(date +%s)
+    fmt_duration $(( now - SCRIPT_START_EPOCH ))
+}
+
+log() { echo -e "[$(ts)] \033[1;34m[*]\033[0m $1"; }
+ok()  { echo -e "[$(ts)] \033[1;32m[+]\033[0m $1"; }
+err() { echo -e "[$(ts)] \033[1;31m[-]\033[0m $1"; }
+warn(){ echo -e "[$(ts)] \033[1;33m[!]\033[0m $1"; }
+
+# stage <deskripsi> - dipanggil di awal tiap stage utama (1-9).
+# Otomatis print: durasi stage sebelumnya, nomor stage & persentase, total elapsed, dan estimasi sisa waktu.
+# CATATAN: estimasi sisa waktu ini KASAR (rata-rata durasi stage yg udah lewat x sisa stage).
+# Gak akurat kalau stage yg beda punya karakter durasi jauh berbeda (mis. enum cepat tapi katana lama) -
+# terutama di awal proses. Anggap ini sekedar gambaran, bukan janji waktu pasti.
+stage() {
+    local now; now=$(date +%s)
+    if [[ "$CURRENT_STAGE" -gt 0 ]]; then
+        echo -e "[$(ts)] \033[1;35m[DURASI]\033[0m Stage $CURRENT_STAGE selesai dalam $(fmt_duration $(( now - LAST_STAGE_START )))"
+    fi
+    CURRENT_STAGE=$((CURRENT_STAGE+1))
+    LAST_STAGE_START=$now
+    local pct=$(( (CURRENT_STAGE-1) * 100 / TOTAL_STAGES ))
+    local elapsed=$(( now - SCRIPT_START_EPOCH ))
+    local eta_str="belum bisa diestimasi"
+    if [[ "$CURRENT_STAGE" -gt 1 ]]; then
+        local completed=$(( CURRENT_STAGE - 1 ))
+        local avg=$(( elapsed / completed ))
+        local remaining=$(( TOTAL_STAGES - completed ))
+        local eta=$(( avg * remaining ))
+        eta_str="~$(fmt_duration $eta) (estimasi KASAR)"
+    fi
+    echo -e "[$(ts)] \033[1;36m[STAGE $CURRENT_STAGE/$TOTAL_STAGES — progress: ${pct}%]\033[0m $1"
+    echo -e "[$(ts)] \033[1;36m           elapsed: $(fmt_duration $elapsed) | estimasi sisa: $eta_str\033[0m"
+}
+
+check_or_install() {
+    local bin_name="$1"; local install_cmd="$2"
+    if command -v "$bin_name" &>/dev/null; then
+        ok "$bin_name sudah terinstall ($(command -v "$bin_name"))"
+    else
+        log "$bin_name belum ada, mencoba install..."
+        eval "$install_cmd"
+        command -v "$bin_name" &>/dev/null && ok "$bin_name berhasil diinstall" || warn "Gagal install $bin_name — tahap terkait akan di-skip"
+    fi
+}
+
+apply_exclude() {
+    local infile="$1"; local outfile="$2"
+    if [[ -f "$EXCLUDE_FILE" && -s "$EXCLUDE_FILE" ]]; then
+        grep -vif "$EXCLUDE_FILE" "$infile" > "$outfile" 2>/dev/null || cp "$infile" "$outfile"
+    else
+        cp "$infile" "$outfile"
+    fi
+}
+
+# heartbeat_monitor <file_output> <total_target> <label> - jalan di background,
+# print progress tiap 60 detik selagi proses utama (mis. dnsx) masih jalan.
+# Bukan pengganti timeout — cuma kasih tau "masih hidup, progressnya segini",
+# biar gak was-was pas nunggu proses yang makan waktu lama.
+heartbeat_monitor() {
+    local file="$1"; local total="$2"; local label="$3"
+    while true; do
+        sleep 60
+        local current; current=$(cat "$file" 2>/dev/null | wc -l)
+        local pct=0
+        [[ "$total" -gt 0 ]] && pct=$(( current * 100 / total ))
+        echo -e "[$(ts)] \033[1;33m[HEARTBEAT]\033[0m $label masih jalan... progress: $current/$total baris (~${pct}%)"
+    done
+}
+
+# simple_heartbeat <label> [interval_detik] - versi tanpa file counter, buat tool yang nulis
+# hasil di akhir doang (buffered), jadi kita gak bisa hitung baris progress-nya. Cuma kasih tau
+# "masih hidup, udah sekian lama", tiap <interval_detik> (default 30s).
+simple_heartbeat() {
+    local label="$1"; local interval="${2:-30}"
+    local start; start=$(date +%s)
+    while true; do
+        sleep "$interval"
+        echo -e "[$(ts)] \033[1;33m[HEARTBEAT]\033[0m $label masih jalan... ($(fmt_duration $(( $(date +%s) - start ))) berlalu, belum ada progress terukur krn tool ini nulis hasil di akhir)"
+    done
+}
+
+# run_takeover_checks <outdir> - dijalankan SEBAGAI BACKGROUND JOB begitu resolved_subs.txt siap.
+# Jalan paralel sama Stage 4-8, gak nunggu / gak ngeblok tahapan lain.
+# Cek terhadap SEMUA subdomain yang resolve (bukan cuma yg 404), krn banyak signature takeover
+# justru muncul di status 200 (mis. "There isn't a GitHub Pages site here", NoSuchBucket S3, dst).
+run_takeover_checks() {
+    local outdir="$1"
+    local errlog="$outdir/tool_errors_takeover.log"
+    mkdir -p "$outdir/takeover"
+    local input="$outdir/resolved_subs.txt"
+    if [[ ! -s "$input" ]]; then
+        touch "$outdir/takeover_candidates.txt" "$outdir/takeover_done.flag"
+        return
+    fi
+
+    if [[ -x "$STRATUS_SUBDOMINATOR_BIN" ]]; then
+        echo "=== [takeover] Subdominator (Stratus-Security) $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+        "$STRATUS_SUBDOMINATOR_BIN" -l "$input" -o "$outdir/takeover/stratus-subdominator_raw.txt" -t 50 --validate 1>/dev/null 2>>"$errlog"
+    fi
+
+    if command -v subzy &>/dev/null; then
+        echo "=== [takeover] subzy $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+        subzy run --targets "$input" --hide_fails --output "$outdir/takeover/subzy_raw.txt" 1>/dev/null 2>>"$errlog"
+    fi
+
+    if command -v nuclei &>/dev/null; then
+        echo "=== [takeover] nuclei http/takeovers/ $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+        nuclei -l "$input" -t http/takeovers/ -silent -o "$outdir/takeover/nuclei_raw.txt" 1>/dev/null 2>>"$errlog"
+    fi
+
+    if command -v subjack &>/dev/null; then
+        # subjack v3.0.0+ TIDAK PAKAI lagi fingerprints.json eksternal (fingerprint sudah native di binary).
+        # Sekalian aktifkan semua deteksi tambahan yang ada: -a (semua URL, direkomendasikan resmi),
+        # -ns (NS delegation takeover), -ar (stale A record), -axfr (zone transfer), -mail (SPF/MX takeover)
+        echo "=== [takeover] subjack (v3, native fingerprint + full checks) $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+        subjack -w "$input" -t 50 -timeout 15 -ssl -a -ns -ar -axfr -mail -v -o "$outdir/takeover/subjack_raw.txt" 1>/dev/null 2>>"$errlog"
+    fi
+
+    if command -v tko-subs &>/dev/null; then
+        local tko_csv="$outdir/takeover/tko-subs-providers.csv"
+        echo "=== [takeover] tko-subs - download providers-data.csv $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+        curl -sL -o "$tko_csv" "https://raw.githubusercontent.com/anshumanbh/tko-subs/master/providers-data.csv" 2>>"$errlog"
+        if [[ -s "$tko_csv" ]]; then
+            echo "=== [takeover] tko-subs run $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+            tko-subs -domains="$input" -data="$tko_csv" -output="$outdir/takeover/tkosubs_raw.csv" 1>/dev/null 2>>"$errlog"
+            [[ -f "$outdir/takeover/tkosubs_raw.csv" ]] && grep -i "true" "$outdir/takeover/tkosubs_raw.csv" > "$outdir/takeover/tkosubs_vulnerable.txt" 2>>"$errlog"
+        else
+            echo "tko-subs: gagal download providers-data.csv ($(wc -c < "$tko_csv" 2>/dev/null || echo 0) byte) — di-skip" >> "$errlog"
+        fi
+    fi
+
+    if [[ -f "$DNSREAPER_DIR/main.py" ]]; then
+        echo "=== [takeover] dnsReaper $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+        # dnsReaper flag OUTPUT yang benar: --out <path> --out-format json (BUKAN --json)
+        python3 "$DNSREAPER_DIR/main.py" file --filename "$input" --out "$outdir/takeover/dnsreaper_raw" --out-format json 1>/dev/null 2>>"$errlog"
+        [[ -f "$outdir/takeover/dnsreaper_raw" && ! -f "$outdir/takeover/dnsreaper_raw.json" ]] && mv "$outdir/takeover/dnsreaper_raw" "$outdir/takeover/dnsreaper_raw.json"
+    fi
+
+    # Konsolidasi semua sumber jadi satu file, tetap simpan raw per-tool buat verifikasi manual
+    cat "$outdir/takeover"/*_raw.txt "$outdir/takeover"/tkosubs_vulnerable.txt 2>/dev/null | grep -v '^\s*$' | sort -u > "$outdir/takeover_candidates.txt"
+    touch "$outdir/takeover_done.flag"
+}
+
+# run_secret_scan <outdir> - dijalankan SEBAGAI BACKGROUND JOB begitu js_files.txt siap (akhir Stage 6).
+# Jalan paralel sama Stage 7-8, gak nunggu / gak ngeblok tahapan lain.
+# Cari token/API key/credential yang ke-expose di JS pakai 3 sumber berbeda:
+#   SecretFinder (regex khusus JS), trufflehog (verified secret detection), nuclei (template token/apikey)
+run_secret_scan() {
+    local outdir="$1"
+    local errlog="$outdir/tool_errors_secrets.log"
+    local js_list="$outdir/js_files.txt"
+    mkdir -p "$outdir/secrets" "$outdir/js_dump"
+    if [[ ! -s "$js_list" ]]; then
+        touch "$outdir/secrets_candidates.txt" "$outdir/secrets_done.flag"
+        return
+    fi
+
+    echo "=== [secrets] download JS files $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+    local i=0
+    while IFS= read -r jsurl; do
+        i=$((i+1))
+        curl -sL -m 15 "$jsurl" -o "$outdir/js_dump/js_${i}.js" 2>>"$errlog"
+    done < "$js_list"
+
+    if [[ -f "$SECRETFINDER_DIR/SecretFinder.py" ]]; then
+        echo "=== [secrets] SecretFinder $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+        : > "$outdir/secrets/secretfinder_raw.txt"
+        while IFS= read -r jsurl; do
+            python3 "$SECRETFINDER_DIR/SecretFinder.py" -i "$jsurl" -o cli 2>>"$errlog" >> "$outdir/secrets/secretfinder_raw.txt"
+        done < "$js_list"
+    fi
+
+    if command -v trufflehog &>/dev/null; then
+        echo "=== [secrets] trufflehog $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+        trufflehog filesystem "$outdir/js_dump" --json --no-update 2>>"$errlog" > "$outdir/secrets/trufflehog_raw.json"
+    fi
+
+    if command -v nuclei &>/dev/null; then
+        echo "=== [secrets] nuclei exposures/tokens+apikeys $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$errlog"
+        nuclei -l "$js_list" -t exposures/tokens/,exposures/apikeys/ -silent -o "$outdir/secrets/nuclei_raw.txt" 2>>"$errlog"
+    fi
+
+    # Konsolidasi (trufflehog JSON diringkas jadi 1 baris per temuan biar konsisten sama file txt lain)
+    if [[ -s "$outdir/secrets/trufflehog_raw.json" ]]; then
+        grep -o '"Raw":"[^"]*"' "$outdir/secrets/trufflehog_raw.json" 2>/dev/null | sed 's/"Raw":"/[trufflehog] /;s/"$//' > "$outdir/secrets/trufflehog_summary.txt"
+    fi
+    cat "$outdir/secrets"/*.txt 2>/dev/null | grep -v '^\s*$' | sort -u > "$outdir/secrets_candidates.txt"
+    touch "$outdir/secrets_done.flag"
+}
+
+detect_chrome() {
+    local bin=""
+    for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+        if command -v "$candidate" &>/dev/null; then bin="$(command -v "$candidate")"; break; fi
+    done
+    if [[ -z "$bin" ]]; then
+        warn "Chrome/Chromium tidak ditemukan, mencoba install chromium..."
+        sudo apt-get install -y chromium 2>/dev/null || sudo apt-get install -y chromium-browser 2>/dev/null
+        for candidate in chromium chromium-browser; do
+            if command -v "$candidate" &>/dev/null; then bin="$(command -v "$candidate")"; break; fi
+        done
+    fi
+    echo "$bin"
+}
+
+# ---------- PRECHECK ----------
+if ! command -v go &>/dev/null; then
+    # Go mungkin sudah terinstall tapi PATH shell ini belum include lokasinya
+    # (umum kejadian kalau install manual via tarball, bukan lewat apt/snap)
+    for candidate_dir in /usr/local/go/bin "$HOME/go/bin" /usr/lib/go/bin /snap/bin /opt/go/bin; do
+        if [[ -x "$candidate_dir/go" ]]; then
+            export PATH="$PATH:$candidate_dir"
+            log "Go ditemukan di $candidate_dir tapi belum ada di PATH — otomatis ditambahkan buat sesi ini."
+            break
+        fi
+    done
+fi
+
+if ! command -v go &>/dev/null; then
+    err "Go tidak ditemukan di PATH manapun (termasuk lokasi umum: /usr/local/go/bin, \$HOME/go/bin, /snap/bin)."
+    err "Diagnostic — jalankan manual buat cek:"
+    err "  which go"
+    err "  ls -la /usr/local/go/bin/go 2>/dev/null"
+    err "  echo \$PATH"
+    err "Kalau Go beneran belum terinstall: sudo apt install golang-go"
+    err "Kalau Go SUDAH terinstall tapi tetap gak ketemu, tambahkan PATH-nya secara permanen ke ~/.bashrc, contoh:"
+    err "  echo 'export PATH=\$PATH:/usr/local/go/bin' >> ~/.bashrc && source ~/.bashrc"
+    exit 1
+fi
+ok "Go ditemukan: $(command -v go) ($(go version 2>/dev/null))"
+mkdir -p "$GOBIN"
+
+if [[ ! -f "$TARGET_FILE" ]]; then
+    err "File target '$TARGET_FILE' tidak ditemukan."
+    echo "Buat dulu: nano $TARGET_FILE  (isi 1 domain per baris)"
+    exit 1
+fi
+
+TARGET_COUNT=$(grep -cve '^\s*$' "$TARGET_FILE")
+[[ "$TARGET_COUNT" -eq 0 ]] && { err "File target kosong."; exit 1; }
+
+mkdir -p "$OUTDIR"
+cp "$TARGET_FILE" "$OUTDIR/targets.txt"
+
+if [[ -n "$LOG_FILE" ]]; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+fi
+
+ok "Ditemukan $TARGET_COUNT target di $TARGET_FILE, output -> $OUTDIR/"
+if [[ -n "$LOG_FILE" ]]; then
+    ok "Logging ke file aktif -> $LOG_FILE (buka pakai 'tail -f $LOG_FILE' atau 'less +F $LOG_FILE' dari terminal lain biar gak kepotong scrollback)"
+fi
+
+if [[ -f "$EXCLUDE_FILE" && -s "$EXCLUDE_FILE" ]]; then
+    cp "$EXCLUDE_FILE" "$OUTDIR/excludes.txt"
+    ok "Exclude-list aktif: $(grep -cve '^\s*$' "$EXCLUDE_FILE") pattern dari $EXCLUDE_FILE"
+else
+    warn "Tidak ada exclude-list — pastikan targets.txt sudah sesuai scope resmi!"
+fi
+
+# ---------- CEK & INSTALL TOOLS ----------
+log "Mengecek dependency tools..."
+check_or_install "subfinder" "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+check_or_install "assetfinder" "go install -v github.com/tomnomnom/assetfinder@latest"
+if command -v cargo &>/dev/null && ! command -v findomain &>/dev/null; then
+    log "findomain belum ada, mencoba install via cargo (bisa agak lama, compile Rust)..."
+    cargo install findomain --locked &>/dev/null
+fi
+command -v findomain &>/dev/null && ok "findomain sudah terinstall" || warn "findomain tidak tersedia, salah satu sumber passive enum akan di-skip"
+
+# github-subdomains & chaos butuh API key/token - opsional, di-skip otomatis kalau env var gak di-set
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    check_or_install "github-subdomains" "go install -v github.com/gwen001/github-subdomains@latest"
+else
+    warn "GITHUB_TOKEN gak di-set — github-subdomains di-skip (opsional, set env GITHUB_TOKEN buat aktifin)"
+fi
+if [[ -n "${CHAOS_API_KEY:-}" ]]; then
+    check_or_install "chaos" "go install -v github.com/projectdiscovery/chaos-client/cmd/chaos@latest"
+else
+    warn "CHAOS_API_KEY gak di-set — chaos di-skip (opsional, daftar gratis di chaos.projectdiscovery.io buat aktifin)"
+fi
+check_or_install "amass"     "go install -v github.com/owasp-amass/amass/v4/...@master"
+check_or_install "dnsx"      "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+check_or_install "alterx"    "go install -v github.com/projectdiscovery/alterx/cmd/alterx@latest"
+check_or_install "gotator"   "go install -v github.com/Josue87/gotator@latest"
+if command -v pip3 &>/dev/null && ! command -v dnsgen &>/dev/null; then
+    log "dnsgen belum ada, mencoba install..."
+    pip3 install --break-system-packages dnsgen &>/dev/null
+fi
+command -v dnsgen &>/dev/null && ok "dnsgen tersedia" || warn "dnsgen tidak tersedia, salah satu sumber permutation akan di-skip"
+if command -v cargo &>/dev/null && ! command -v ripgen &>/dev/null; then
+    log "ripgen belum ada, mencoba install via cargo..."
+    cargo install ripgen &>/dev/null
+fi
+command -v ripgen &>/dev/null && ok "ripgen tersedia" || warn "ripgen tidak tersedia, salah satu sumber permutation akan di-skip"
+check_or_install "httpx"     "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
+check_or_install "katana"    "go install -v github.com/projectdiscovery/katana/cmd/katana@latest"
+check_or_install "gau"       "go install -v github.com/lc/gau/v2/cmd/gau@latest"
+check_or_install "waybackurls" "go install -v github.com/tomnomnom/waybackurls@latest"
+check_or_install "gauplus"    "go install -v github.com/bp0lr/gauplus@latest"
+check_or_install "subjs"     "go install -v github.com/lc/subjs@latest"
+check_or_install "nuclei"    "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+if command -v nuclei &>/dev/null; then
+    log "Memastikan nuclei templates up-to-date (kalau kosong, semua scan nuclei bakal 0 hasil tanpa error)..."
+    nuclei -update-templates 1>/dev/null 2>>"/tmp/nuclei_template_update.log" || true
+    NUCLEI_TEMPLATE_DIR="${HOME}/nuclei-templates"
+    if [[ -d "$NUCLEI_TEMPLATE_DIR" ]]; then
+        ok "Nuclei templates tersedia di $NUCLEI_TEMPLATE_DIR ($(find "$NUCLEI_TEMPLATE_DIR" -name '*.yaml' 2>/dev/null | wc -l) template)"
+    else
+        warn "Nuclei templates gak ketemu di lokasi default — hasil scan nuclei kemungkinan bakal kosong. Cek /tmp/nuclei_template_update.log"
+    fi
+fi
+
+# Tools subdomain takeover — 5 sumber fingerprint berbeda biar coverage maksimal
+check_or_install "subzy"     "go install -v github.com/PentestPad/subzy@latest"
+check_or_install "subjack"   "go install -v github.com/haccer/subjack@latest"
+check_or_install "tko-subs"  "go install -v github.com/anshumanbh/tko-subs@latest"
+
+# Subdominator (Stratus-Security, C#) - takeover checker asli, benchmark 100k subdomain 19 menit
+# (vs subjack 2.5 jam). Bukan Python/pip package "SubDominator" (beda tool, itu buat enum).
+# Distribusi cuma binary compiled, gak ada di package manager - download langsung dari GitHub Releases.
+STRATUS_SUBDOMINATOR_BIN="${GOBIN}/../stratus-subdominator/Subdominator"
+if [[ ! -x "$STRATUS_SUBDOMINATOR_BIN" ]]; then
+    log "Subdominator (Stratus-Security, takeover checker) belum ada, mencoba download binary..."
+    mkdir -p "$(dirname "$STRATUS_SUBDOMINATOR_BIN")"
+    curl -sL -o "$STRATUS_SUBDOMINATOR_BIN" "https://github.com/Stratus-Security/Subdominator/releases/latest/download/Subdominator" 2>/tmp/stratus_dl.log
+    chmod +x "$STRATUS_SUBDOMINATOR_BIN" 2>/dev/null
+fi
+[[ -x "$STRATUS_SUBDOMINATOR_BIN" ]] && ok "Subdominator (Stratus-Security, takeover) tersedia" || warn "Subdominator (Stratus-Security) gagal didownload, salah satu sumber takeover-check akan di-skip"
+
+# Sublist3r - classic passive subdomain enum tool, sumber beda (search engine scraping: google/bing/yahoo/baidu/ask + netcraft/virustotal/threatcrowd/dnsdumpster)
+SUBLIST3R_DIR="${GOBIN}/../Sublist3r"
+if [[ ! -f "$SUBLIST3R_DIR/sublist3r.py" ]]; then
+    log "Sublist3r belum ada, mencoba install (clone + pip requirements)..."
+    git clone --depth 1 https://github.com/aboul3la/Sublist3r.git "$SUBLIST3R_DIR" &>/dev/null
+    if [[ -f "$SUBLIST3R_DIR/requirements.txt" ]]; then
+        pip3 install --break-system-packages -r "$SUBLIST3R_DIR/requirements.txt" &>/dev/null
+    fi
+fi
+[[ -f "$SUBLIST3R_DIR/sublist3r.py" ]] && ok "Sublist3r tersedia" || warn "Sublist3r tidak tersedia, salah satu sumber passive enum akan di-skip"
+
+# theHarvester - multi-source OSINT klasik (puluhan search engine/API), kita ambil subdomain-nya doang
+THEHARVESTER_DIR="${GOBIN}/../theHarvester"
+if [[ ! -f "$THEHARVESTER_DIR/theHarvester.py" ]]; then
+    log "theHarvester belum ada, mencoba install (clone + pip requirements)..."
+    git clone --depth 1 https://github.com/laramies/theHarvester.git "$THEHARVESTER_DIR" &>/dev/null
+    if [[ -f "$THEHARVESTER_DIR/requirements/base.txt" ]]; then
+        pip3 install --break-system-packages -r "$THEHARVESTER_DIR/requirements/base.txt" &>/dev/null
+    fi
+fi
+[[ -f "$THEHARVESTER_DIR/theHarvester.py" ]] && ok "theHarvester tersedia" || warn "theHarvester tidak tersedia, salah satu sumber passive enum akan di-skip"
+
+DNSREAPER_DIR="${GOBIN}/../dnsReaper"
+if [[ ! -d "$DNSREAPER_DIR" ]]; then
+    log "dnsReaper belum ada, mencoba install (clone + pip requirements)..."
+    git clone --depth 1 https://github.com/punk-security/dnsReaper.git "$DNSREAPER_DIR" &>/dev/null
+    if [[ -f "$DNSREAPER_DIR/requirements.txt" ]]; then
+        pip3 install --break-system-packages -r "$DNSREAPER_DIR/requirements.txt" &>/dev/null
+    fi
+fi
+[[ -f "$DNSREAPER_DIR/main.py" ]] && ok "dnsReaper tersedia" || warn "dnsReaper tidak tersedia, salah satu sumber takeover-check akan di-skip"
+
+# Tools JS secret scanning — cari token/API key/credential yang ke-expose di JS
+check_or_install "trufflehog" "go install github.com/trufflesecurity/trufflehog/v3@latest"
+SECRETFINDER_DIR="${GOBIN}/../SecretFinder"
+if [[ ! -f "$SECRETFINDER_DIR/SecretFinder.py" ]]; then
+    log "SecretFinder belum ada, mencoba install (clone + pip requirements)..."
+    git clone --depth 1 https://github.com/m4ll0k/SecretFinder.git "$SECRETFINDER_DIR" &>/dev/null
+    if [[ -f "$SECRETFINDER_DIR/requirements.txt" ]]; then
+        pip3 install --break-system-packages -r "$SECRETFINDER_DIR/requirements.txt" &>/dev/null
+    fi
+fi
+[[ -f "$SECRETFINDER_DIR/SecretFinder.py" ]] && ok "SecretFinder tersedia" || warn "SecretFinder tidak tersedia, salah satu sumber secret-scan akan di-skip"
+
+if command -v pip3 &>/dev/null && ! command -v arjun &>/dev/null; then
+    log "arjun belum ada, mencoba install..."
+    pip3 install --break-system-packages arjun &>/dev/null
+fi
+command -v arjun &>/dev/null && ok "arjun tersedia" || warn "arjun tidak tersedia, parameter discovery akan di-skip"
+
+if ! command -v gowitness &>/dev/null; then
+    log "gowitness belum ada, mencoba install..."
+    go install -v github.com/sensepost/gowitness@latest
+fi
+command -v gowitness &>/dev/null && ok "gowitness tersedia" || warn "gowitness gagal diinstall (butuh chromium)"
+
+# Deteksi Chrome/Chromium SEKALI di awal, dipakai bareng oleh katana -hl dan gowitness
+log "Mendeteksi browser Chrome/Chromium..."
+CHROME_BIN="$(detect_chrome)"
+[[ -n "$CHROME_BIN" ]] && ok "Browser terdeteksi: $CHROME_BIN" || warn "Browser tidak ditemukan, headless crawl & screenshot akan di-skip"
+
+RESOLVERS_FILE="$OUTDIR/resolvers.txt"
+log "Mengambil resolver list terkini..."
+if curl -s -o "$RESOLVERS_FILE" "$RESOLVERS_URL" && [[ -s "$RESOLVERS_FILE" ]]; then
+    ok "Resolver list disimpan ($(cat "$RESOLVERS_FILE" 2>/dev/null | wc -l) resolver)"
+else
+    warn "Gagal ambil resolver list, dnsx pakai resolver default sistem"
+    rm -f "$RESOLVERS_FILE"
+fi
+
+# ---------- STAGE 1: PASSIVE ENUM MULTI-SUMBER + ACTIVE ZONE TRANSFER CHECK (skip kalau targeted) ----------
+if [[ "$SCAN_MODE" == "wildcard" ]]; then
+    stage "Passive enum 9-sumber + AXFR check (active) [mode: wildcard]"
+    : > "$OUTDIR/raw_subs_pre_exclude.txt"
+    : > "$OUTDIR/axfr_results.txt"
+    while IFS= read -r domain; do
+        [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+        log "  -> $domain"
+
+        t0=$(date +%s)
+        log "     [PASSIVE 1/9] subfinder..."
+        subfinder -d "$domain" -all -silent >> "$OUTDIR/raw_subs_pre_exclude.txt" 2>>"$OUTDIR/tool_errors.log"
+        log "     [PASSIVE 1/9] subfinder selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+
+        if command -v amass &>/dev/null; then
+            t0=$(date +%s)
+            log "     [PASSIVE 2/9] amass..."
+            simple_heartbeat "amass ($domain)" 30 &
+            HB_PID=$!
+            amass enum -passive -d "$domain" -silent >> "$OUTDIR/raw_subs_pre_exclude.txt" 2>>"$OUTDIR/tool_errors.log"
+            kill "$HB_PID" 2>/dev/null; wait "$HB_PID" 2>/dev/null
+            log "     [PASSIVE 2/9] amass selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+        else
+            log "     [PASSIVE 2/9] amass di-skip (gak terinstall)"
+        fi
+
+        if command -v assetfinder &>/dev/null; then
+            t0=$(date +%s)
+            log "     [PASSIVE 3/9] assetfinder..."
+            assetfinder --subs-only "$domain" >> "$OUTDIR/raw_subs_pre_exclude.txt" 2>>"$OUTDIR/tool_errors.log"
+            log "     [PASSIVE 3/9] assetfinder selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+        else
+            log "     [PASSIVE 3/9] assetfinder di-skip (gak terinstall)"
+        fi
+
+        if command -v findomain &>/dev/null; then
+            t0=$(date +%s)
+            log "     [PASSIVE 4/9] findomain..."
+            findomain -t "$domain" -q >> "$OUTDIR/raw_subs_pre_exclude.txt" 2>>"$OUTDIR/tool_errors.log"
+            log "     [PASSIVE 4/9] findomain selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+        else
+            log "     [PASSIVE 4/9] findomain di-skip (gak terinstall)"
+        fi
+
+        t0=$(date +%s)
+        log "     [PASSIVE 5/9] crt.sh (certificate transparency)..."
+        curl -s "https://crt.sh/?q=%25.${domain}&output=json" \
+            | grep -oE '"name_value":"[^"]+"' | sed -E 's/"name_value":"//;s/"//' \
+            | sed 's/\*\.//g' | tr ',' '\n' >> "$OUTDIR/raw_subs_pre_exclude.txt" 2>/dev/null
+        log "     [PASSIVE 5/9] crt.sh selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+
+        t0=$(date +%s)
+        log "     [PASSIVE 6/9] Certspotter (certificate transparency, sumber beda dari crt.sh)..."
+        curl -s "https://api.certspotter.com/v1/issuances?domain=${domain}&include_subdomains=true&expand=dns_names" \
+            | grep -oE '"dns_names":\[[^]]+\]' | grep -oE '"[a-zA-Z0-9_.*-]+\.'"${domain//./\\.}"'"' \
+            | tr -d '"' | sed 's/^\*\.//' >> "$OUTDIR/raw_subs_pre_exclude.txt" 2>>"$OUTDIR/tool_errors.log"
+        log "     [PASSIVE 6/9] Certspotter selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+
+        if [[ -f "$SUBLIST3R_DIR/sublist3r.py" ]]; then
+            t0=$(date +%s)
+            log "     [PASSIVE 7/9] Sublist3r (search engine scraping)..."
+            python3 "$SUBLIST3R_DIR/sublist3r.py" -d "$domain" -o "$OUTDIR/.sublist3r_tmp.txt" 2>>"$OUTDIR/tool_errors.log" 1>/dev/null
+            [[ -f "$OUTDIR/.sublist3r_tmp.txt" ]] && cat "$OUTDIR/.sublist3r_tmp.txt" >> "$OUTDIR/raw_subs_pre_exclude.txt" && rm -f "$OUTDIR/.sublist3r_tmp.txt"
+            log "     [PASSIVE 7/9] Sublist3r selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+        else
+            log "     [PASSIVE 7/9] Sublist3r di-skip (gak terinstall)"
+        fi
+
+        if [[ -f "$THEHARVESTER_DIR/theHarvester.py" ]]; then
+            t0=$(date +%s)
+            log "     [PASSIVE 8/9] theHarvester (multi-source OSINT)..."
+            (cd "$THEHARVESTER_DIR" && python3 theHarvester.py -d "$domain" -b all -f "$OUTDIR/.theharvester_tmp" 2>>"$OUTDIR/tool_errors.log" 1>/dev/null)
+            if [[ -f "$OUTDIR/.theharvester_tmp.json" ]]; then
+                grep -oE '"[a-zA-Z0-9_.-]+\.'"${domain//./\\.}"'"' "$OUTDIR/.theharvester_tmp.json" | tr -d '"' >> "$OUTDIR/raw_subs_pre_exclude.txt"
+                rm -f "$OUTDIR/.theharvester_tmp.json"
+            fi
+            log "     [PASSIVE 8/9] theHarvester selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+        else
+            log "     [PASSIVE 8/9] theHarvester di-skip (gak terinstall)"
+        fi
+
+        if command -v github-subdomains &>/dev/null && [[ -n "${GITHUB_TOKEN:-}" ]]; then
+            t0=$(date +%s)
+            log "     [PASSIVE 9/9] github-subdomains (code search)..."
+            github-subdomains -d "$domain" -t "$GITHUB_TOKEN" >> "$OUTDIR/raw_subs_pre_exclude.txt" 2>>"$OUTDIR/tool_errors.log"
+            log "     [PASSIVE 9/9] github-subdomains selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+        else
+            log "     [PASSIVE 9/9] github-subdomains di-skip (gak terinstall / GITHUB_TOKEN gak di-set)"
+        fi
+
+        if command -v chaos &>/dev/null && [[ -n "${CHAOS_API_KEY:-}" ]]; then
+            t0=$(date +%s)
+            log "     [PASSIVE bonus] chaos (ProjectDiscovery dataset)..."
+            chaos -d "$domain" -key "$CHAOS_API_KEY" -silent >> "$OUTDIR/raw_subs_pre_exclude.txt" 2>>"$OUTDIR/tool_errors.log"
+            log "     [PASSIVE bonus] chaos selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+        fi
+
+        # ACTIVE: zone transfer (AXFR) check - coba tiap nameserver domain, laporan kalau ada yg misconfigured
+        if command -v dig &>/dev/null; then
+            t0=$(date +%s)
+            log "     [ACTIVE] Zone transfer (AXFR) check ke semua nameserver..."
+            ns_list=$(dig +short NS "$domain" 2>>"$OUTDIR/tool_errors.log")
+            if [[ -n "$ns_list" ]]; then
+                while IFS= read -r ns; do
+                    [[ -z "$ns" ]] && continue
+                    axfr_result=$(dig axfr "$domain" "@$ns" 2>>"$OUTDIR/tool_errors.log")
+                    # AXFR sukses kalau ada lebih dari 1 baris SOA record (transfer normal cuma nolak/timeout kalau di-disable)
+                    if [[ -n "$axfr_result" ]] && [[ "$(echo "$axfr_result" | grep -c 'SOA')" -gt 1 ]]; then
+                        echo "!!! AXFR TERBUKA di $ns untuk $domain !!!" >> "$OUTDIR/axfr_results.txt"
+                        echo "$axfr_result" >> "$OUTDIR/axfr_results.txt"
+                        err "  !!! ZONE TRANSFER TERBUKA di $ns untuk $domain — cek $OUTDIR/axfr_results.txt !!!"
+                    fi
+                done <<< "$ns_list"
+            fi
+            log "     [ACTIVE] AXFR check selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+        else
+            log "     [ACTIVE] AXFR check di-skip (dig gak terinstall — sudo apt install dnsutils)"
+        fi
+    done < "$TARGET_FILE"
+    sort -u "$OUTDIR/raw_subs_pre_exclude.txt" -o "$OUTDIR/raw_subs_pre_exclude.txt"
+else
+    stage "Skip passive enum [mode: targeted] — pakai targets.txt apa adanya sebagai host list"
+    sort -u "$TARGET_FILE" -o "$OUTDIR/raw_subs_pre_exclude.txt" 2>/dev/null || cp "$TARGET_FILE" "$OUTDIR/raw_subs_pre_exclude.txt"
+fi
+
+apply_exclude "$OUTDIR/raw_subs_pre_exclude.txt" "$OUTDIR/raw_subs.txt"
+EXCLUDED_COUNT=$(( $(cat "$OUTDIR/raw_subs_pre_exclude.txt" 2>/dev/null | wc -l) - $(cat "$OUTDIR/raw_subs.txt" 2>/dev/null | wc -l) ))
+ok "Host awal: $(cat "$OUTDIR/raw_subs.txt" 2>/dev/null | wc -l) unik, $EXCLUDED_COUNT di-exclude sesuai scope"
+
+# ---------- STAGE 2: ACTIVE GENERATION - PERMUTATION (multi-tools) + WORDLIST BRUTEFORCE (skip kalau targeted) ----------
+if [[ "$SCAN_MODE" == "wildcard" ]]; then
+    stage "Active generation: permutation (alterx+gotator+dnsgen+ripgen) + wordlist bruteforce [mode: wildcard]"
+
+    # Wordlist dipakai bareng oleh gotator/dnsgen/ripgen (butuh wordlist eksplisit) DAN straightforward bruteforce di bawah
+    WORDLIST_CACHE="$HOME/.cache/recon_subdomain_wordlist.txt"
+    mkdir -p "$(dirname "$WORDLIST_CACHE")"
+    if [[ ! -s "$WORDLIST_CACHE" ]]; then
+        log "  Download wordlist SecLists (sekali aja, di-cache buat run selanjutnya)..."
+        curl -sL -o "$WORDLIST_CACHE" "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt" 2>>"$OUTDIR/tool_errors.log"
+    fi
+
+    : > "$OUTDIR/permutations_raw.txt"
+
+    if command -v alterx &>/dev/null; then
+        t0=$(date +%s)
+        log "  [PERM 1/4] alterx..."
+        alterx -l "$OUTDIR/raw_subs.txt" -silent -o "$OUTDIR/alterx_raw.txt" 2>>"$OUTDIR/tool_errors.log"
+        cat "$OUTDIR/alterx_raw.txt" >> "$OUTDIR/permutations_raw.txt" 2>/dev/null
+        log "  [PERM 1/4] alterx selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+    else
+        log "  [PERM 1/4] alterx di-skip (gak terinstall)"
+    fi
+
+    if command -v gotator &>/dev/null && [[ -s "$WORDLIST_CACHE" ]]; then
+        t0=$(date +%s)
+        log "  [PERM 2/4] gotator..."
+        gotator -sub "$OUTDIR/raw_subs.txt" -perm "$WORDLIST_CACHE" -depth 1 -numbers 3 -mindup -adv -silent >> "$OUTDIR/permutations_raw.txt" 2>>"$OUTDIR/tool_errors.log"
+        log "  [PERM 2/4] gotator selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+    else
+        log "  [PERM 2/4] gotator di-skip (gak terinstall / wordlist gak ada)"
+    fi
+
+    if command -v dnsgen &>/dev/null; then
+        t0=$(date +%s)
+        log "  [PERM 3/4] dnsgen..."
+        cat "$OUTDIR/raw_subs.txt" | dnsgen - 2>>"$OUTDIR/tool_errors.log" >> "$OUTDIR/permutations_raw.txt"
+        log "  [PERM 3/4] dnsgen selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+    else
+        log "  [PERM 3/4] dnsgen di-skip (gak terinstall)"
+    fi
+
+    if command -v ripgen &>/dev/null && [[ -s "$WORDLIST_CACHE" ]]; then
+        t0=$(date +%s)
+        log "  [PERM 4/4] ripgen..."
+        ripgen -d "$OUTDIR/raw_subs.txt" -w "$WORDLIST_CACHE" 2>>"$OUTDIR/tool_errors.log" >> "$OUTDIR/permutations_raw.txt"
+        log "  [PERM 4/4] ripgen selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+    else
+        log "  [PERM 4/4] ripgen di-skip (gak terinstall / wordlist gak ada)"
+    fi
+
+    sort -u "$OUTDIR/permutations_raw.txt" -o "$OUTDIR/permutations_raw.txt"
+    apply_exclude "$OUTDIR/permutations_raw.txt" "$OUTDIR/permutations.txt"
+    cat "$OUTDIR/permutations.txt" >> "$OUTDIR/raw_subs.txt" 2>/dev/null
+    sort -u "$OUTDIR/raw_subs.txt" -o "$OUTDIR/raw_subs.txt"
+    ok "Permutation (gabungan 4 tools, dedup): total sekarang $(cat "$OUTDIR/raw_subs.txt" 2>/dev/null | wc -l) kandidat"
+
+    # ACTIVE: straightforward wordlist bruteforce (word.domain langsung, bukan mutasi kata yang udah ketemu) -
+    # biar nemu subdomain yang GAK muncul di sumber passive/permutation manapun
+    log "  [ACTIVE] Straightforward wordlist bruteforce (SecLists common subdomains)..."
+    if [[ -s "$WORDLIST_CACHE" ]]; then
+        : > "$OUTDIR/wordlist_bruteforce_raw.txt"
+        while IFS= read -r domain; do
+            [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+            awk -v d="$domain" '{print $0"."d}' "$WORDLIST_CACHE" >> "$OUTDIR/wordlist_bruteforce_raw.txt"
+        done < "$TARGET_FILE"
+        apply_exclude "$OUTDIR/wordlist_bruteforce_raw.txt" "$OUTDIR/wordlist_bruteforce.txt"
+        cat "$OUTDIR/wordlist_bruteforce.txt" >> "$OUTDIR/raw_subs.txt"
+        sort -u "$OUTDIR/raw_subs.txt" -o "$OUTDIR/raw_subs.txt"
+        ok "  [ACTIVE] Wordlist bruteforce ($(cat "$WORDLIST_CACHE" | wc -l) kata x $TARGET_COUNT domain): total sekarang $(cat "$OUTDIR/raw_subs.txt" 2>/dev/null | wc -l) kandidat"
+    else
+        warn "  [ACTIVE] Gagal download wordlist, skip bruteforce"
+    fi
+else
+    stage "Skip permutation [mode: targeted] — host sudah presisi, gak perlu digenerate lagi"
+fi
+
+# ---------- STAGE 3: MASS RESOLVE ----------
+stage "Mass-resolve dengan dnsx"
+CANDIDATE_COUNT=$(cat "$OUTDIR/raw_subs.txt" 2>/dev/null | wc -l)
+if [[ "$CANDIDATE_COUNT" -gt 50000 ]]; then
+    warn "Kandidat subdomain SANGAT BANYAK ($CANDIDATE_COUNT) — kemungkinan besar dari permutation."
+    warn "Proses TETAP akan dijalankan sampai tuntas (tanpa cutoff), tapi ini bisa makan waktu cukup lama."
+fi
+if command -v dnsx &>/dev/null; then
+    log "Menjalankan dnsx TANPA batas waktu keseluruhan (bakal jalan sampai semua kandidat selesai dicoba)."
+    log "Per-query timeout tetap dipasang (5s) supaya resolver yang mati/gak respon gak bikin satu query nyangkut lama — bukan buat motong proses secara keseluruhan."
+    touch "$OUTDIR/resolved_subs_raw.txt"
+    heartbeat_monitor "$OUTDIR/resolved_subs_raw.txt" "$CANDIDATE_COUNT" "dnsx resolve" &
+    HEARTBEAT_PID=$!
+    if [[ -f "$RESOLVERS_FILE" ]]; then
+        dnsx -l "$OUTDIR/raw_subs.txt" -silent -r "$RESOLVERS_FILE" -t "$DNSX_THREADS" -retry 1 -timeout 5 -o "$OUTDIR/resolved_subs_raw.txt" 2>>"$OUTDIR/tool_errors.log"
+    else
+        dnsx -l "$OUTDIR/raw_subs.txt" -silent -t "$DNSX_THREADS" -retry 1 -timeout 5 -o "$OUTDIR/resolved_subs_raw.txt" 2>>"$OUTDIR/tool_errors.log"
+    fi
+    kill "$HEARTBEAT_PID" 2>/dev/null; wait "$HEARTBEAT_PID" 2>/dev/null
+    touch "$OUTDIR/resolved_subs_raw.txt"
+    apply_exclude "$OUTDIR/resolved_subs_raw.txt" "$OUTDIR/resolved_subs.txt"
+    RESOLVED_COUNT=$(cat "$OUTDIR/resolved_subs.txt" 2>/dev/null | wc -l)
+    ok "Resolved: $RESOLVED_COUNT subdomain valid & in-scope (SEMUA kandidat sudah dicoba, tuntas)"
+    if [[ "$RESOLVED_COUNT" -eq 0 && "$CANDIDATE_COUNT" -gt 0 ]]; then
+        err "0 dari $CANDIDATE_COUNT kandidat berhasil resolve — ini ANEH, kemungkinan ada masalah (resolver rusak/format salah, dnsx error, dll)."
+        err "Cek isi $OUTDIR/tool_errors.log buat lihat pesan error asli dari dnsx sebelum lanjut percaya hasil recon ini."
+    fi
+else
+    warn "dnsx tidak tersedia, pakai raw_subs.txt langsung"
+    apply_exclude "$OUTDIR/raw_subs.txt" "$OUTDIR/resolved_subs.txt"
+fi
+
+# Launch subdomain takeover check di BACKGROUND begitu resolved_subs.txt siap.
+# Jalan paralel sama Stage 4-8 (httpx/gau/katana/arjun/gowitness), hasilnya di-join sebelum report.
+log "Melepas subdomain takeover check (Subdominator+subzy+nuclei+subjack+tko-subs+dnsReaper) ke background — jalan paralel, gak nunggu."
+run_takeover_checks "$OUTDIR" &
+TAKEOVER_PID=$!
+ok "Takeover check jalan di background (PID: $TAKEOVER_PID)"
+
+# ---------- STAGE 4: LIVE HOST CHECK (MULTI-PORT) ----------
+stage "Live host check + tech fingerprint (httpx, multi-port)"
+EXTRA_PORTS="${EXTRA_PORTS:-80,81,443,591,593,832,981,1080,1311,2082,2083,2086,2087,2095,2096,2480,3000,3001,3128,3333,4243,4567,4711,4712,5000,5104,5601,5985,5986,6080,6443,6543,7000,7001,7002,7070,7080,7081,7100,7443,7777,8000,8001,8008,8009,8010,8020,8028,8030,8042,8069,8070,8071,8080,8081,8082,8083,8088,8090,8091,8092,8100,8118,8123,8180,8181,8222,8243,8280,8281,8333,8443,8500,8600,8643,8686,8800,8834,8880,8881,8883,8888,9000,9001,9002,9043,9080,9081,9090,9091,9092,9100,9200,9300,9440,9443,9999,10000,10443,15672,18080,27017,50070,50075}"
+httpx -l "$OUTDIR/resolved_subs.txt" -ports "$EXTRA_PORTS" -status-code -title -tech-detect -silent \
+    -rate-limit "$HTTPX_RATE" -threads "$HTTPX_THREADS" -o "$OUTDIR/live_hosts.txt"
+ok "Live hosts: $(cat "$OUTDIR/live_hosts.txt" 2>/dev/null | wc -l) host [semua port, rate: $HTTPX_RATE/s]"
+
+awk '{print $1}' "$OUTDIR/live_hosts.txt" | sed -E 's#https?://##' > "$OUTDIR/live_hosts_only.txt"
+awk '{print $1}' "$OUTDIR/live_hosts.txt" > "$OUTDIR/clean_urls_for_screenshot.txt"
+
+# Subset "hidup beneran" (bukan 404) buat headless fallback - hindari waste resource di error page generik
+grep -Ev '\[404( |\])' "$OUTDIR/live_hosts.txt" | awk '{print $1}' > "$OUTDIR/interesting_hosts_all.txt"
+head -n "$KATANA_HEADLESS_LIMIT" "$OUTDIR/interesting_hosts_all.txt" > "$OUTDIR/interesting_hosts_for_headless.txt"
+ok "Host non-404 (kandidat headless crawl): $(cat "$OUTDIR/interesting_hosts_all.txt" 2>/dev/null | wc -l), dibatasi ke $(cat "$OUTDIR/interesting_hosts_for_headless.txt" 2>/dev/null | wc -l) teratas utk headless"
+
+# ---------- STAGE 5: HISTORICAL URL MINING + FILTERING (gau + waybackurls + gauplus) ----------
+stage "Historical URL mining (gau + waybackurls + gauplus)"
+: > "$OUTDIR/historical_urls_raw.txt"
+while IFS= read -r domain; do
+    [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+
+    if command -v gau &>/dev/null; then
+        t0=$(date +%s)
+        log "  [1/3] gau ($domain) - provider: wayback,commoncrawl,otx,urlscan..."
+        gau --subs --providers wayback,commoncrawl,otx,urlscan "$domain" 2>>"$OUTDIR/tool_errors.log" >> "$OUTDIR/historical_urls_raw.txt"
+        log "  [1/3] gau selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+    fi
+
+    if command -v waybackurls &>/dev/null; then
+        t0=$(date +%s)
+        log "  [2/3] waybackurls ($domain)..."
+        echo "$domain" | waybackurls 2>>"$OUTDIR/tool_errors.log" >> "$OUTDIR/historical_urls_raw.txt"
+        log "  [2/3] waybackurls selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+    fi
+
+    if command -v gauplus &>/dev/null; then
+        t0=$(date +%s)
+        log "  [3/3] gauplus ($domain)..."
+        gauplus -subs "$domain" 2>>"$OUTDIR/tool_errors.log" >> "$OUTDIR/historical_urls_raw.txt"
+        log "  [3/3] gauplus selesai ($(fmt_duration $(( $(date +%s) - t0 ))))"
+    fi
+done < "$TARGET_FILE"
+
+if [[ -s "$OUTDIR/historical_urls_raw.txt" ]]; then
+    sort -u "$OUTDIR/historical_urls_raw.txt" -o "$OUTDIR/historical_urls_raw.txt"
+    apply_exclude "$OUTDIR/historical_urls_raw.txt" "$OUTDIR/historical_urls.txt"
+    ok "Historical URLs (gabungan gau+waybackurls+gauplus, dedup): $(cat "$OUTDIR/historical_urls.txt" 2>/dev/null | wc -l) URL (setelah exclude)"
+
+    grep -E '\?[a-zA-Z0-9_]+=' "$OUTDIR/historical_urls.txt" | sort -u > "$OUTDIR/urls_with_params.txt"
+    grep -Ei '/(api|graphql|v[0-9]+|internal|admin|backend)(/|\?|$)' "$OUTDIR/historical_urls.txt" | sort -u > "$OUTDIR/urls_api_like.txt"
+    grep -Ei '\.(json|xml|env|config|conf|yml|yaml|sql|bak|zip|tar|gz|log|git)(\?|$)' "$OUTDIR/historical_urls.txt" | sort -u > "$OUTDIR/urls_sensitive_ext.txt"
+    grep -oE '[?&][a-zA-Z0-9_]+=' "$OUTDIR/historical_urls.txt" | sed -E 's/^[?&]//;s/=$//' | sort -u > "$OUTDIR/param_names.txt"
+
+    ok "  -> urls_with_params.txt   : $(cat "$OUTDIR/urls_with_params.txt" 2>/dev/null | wc -l)"
+    ok "  -> urls_api_like.txt      : $(cat "$OUTDIR/urls_api_like.txt" 2>/dev/null | wc -l)"
+    ok "  -> urls_sensitive_ext.txt : $(cat "$OUTDIR/urls_sensitive_ext.txt" 2>/dev/null | wc -l)"
+    ok "  -> param_names.txt        : $(cat "$OUTDIR/param_names.txt" 2>/dev/null | wc -l)"
+else
+    warn "gau/waybackurls/gauplus tidak ada satupun yang tersedia atau tidak ada hasil, skip historical URL mining"
+fi
+
+
+# ---------- STAGE 6: CRAWL + JS ENDPOINT MINING (STATIC utk semua host, HEADLESS fallback utk subset) ----------
+stage "Crawl + JS endpoint mining (katana static -jc -kf all)"
+if command -v katana &>/dev/null; then
+    log "Static crawl TANPA batas waktu keseluruhan (bakal jalan sampai crawl tuntas)."
+    log "Per-request timeout tetap 10s supaya 1 halaman yg gak pernah 'selesai load' (chat widget/polling script) gak bikin SELURUH proses nyangkut — bukan buat motong hasil crawl."
+    katana -list "$OUTDIR/live_hosts_only.txt" -jc -kf all -timeout 10 \
+        -silent -rate-limit "$HTTPX_RATE" \
+        -o "$OUTDIR/katana_static_raw.txt" 2>>"$OUTDIR/tool_errors.log"
+    touch "$OUTDIR/katana_static_raw.txt"
+    apply_exclude "$OUTDIR/katana_static_raw.txt" "$OUTDIR/katana_static.txt"
+    ok "Static crawl: $(cat "$OUTDIR/katana_static.txt" 2>/dev/null | wc -l) URL ditemukan (semua host, semua port)"
+
+    if [[ -n "$CHROME_BIN" && -s "$OUTDIR/interesting_hosts_for_headless.txt" ]]; then
+        log "  [Stage 6 - sub] Headless fallback (katana -hl) untuk $(cat "$OUTDIR/interesting_hosts_for_headless.txt" 2>/dev/null | wc -l) host non-404, TANPA batas waktu keseluruhan (per-request timeout 15s tetap aktif)..."
+        katana -list "$OUTDIR/interesting_hosts_for_headless.txt" -jc -kf all -hl -system-chrome \
+            -timeout 15 -silent \
+            -rate-limit "$HTTPX_RATE" -o "$OUTDIR/katana_headless_raw.txt" 2>>"$OUTDIR/tool_errors.log"
+        touch "$OUTDIR/katana_headless_raw.txt"
+        apply_exclude "$OUTDIR/katana_headless_raw.txt" "$OUTDIR/katana_headless.txt"
+        ok "Headless crawl: $(cat "$OUTDIR/katana_headless.txt" 2>/dev/null | wc -l) URL tambahan (SPA/JS-rendered content)"
+    else
+        warn "Skip headless fallback (browser tidak ada / tidak ada host non-404)"
+        : > "$OUTDIR/katana_headless.txt"
+    fi
+
+    cat "$OUTDIR/katana_static.txt" "$OUTDIR/katana_headless.txt" 2>/dev/null | sort -u > "$OUTDIR/katana_urls.txt"
+    ok "Katana total (static+headless, dedup): $(cat "$OUTDIR/katana_urls.txt" 2>/dev/null | wc -l)"
+
+    grep -E '\.js(\?|$)' "$OUTDIR/katana_urls.txt" 2>/dev/null | sort -u > "$OUTDIR/js_files.txt"
+    ok "JS files ditemukan: $(cat "$OUTDIR/js_files.txt" 2>/dev/null | wc -l)"
+
+    # Launch JS secret scan di BACKGROUND begitu js_files.txt siap.
+    # Fungsi ini JUGA download semua JS ke js_dump/ - dipakai bareng buat ekstraksi endpoint di Stage 8,
+    # biar gak download 2x (dulu ada loop curl terpisah di sini yang boros + gak ada timeout per-request).
+    log "Melepas JS secret scan (SecretFinder+trufflehog+nuclei) ke background — jalan paralel, gak nunggu."
+    run_secret_scan "$OUTDIR" &
+    SECRETS_PID=$!
+    ok "Secret scan jalan di background (PID: $SECRETS_PID)"
+
+    cat "$OUTDIR/katana_urls.txt" "$OUTDIR"/historical_urls.txt 2>/dev/null | sort -u > "$OUTDIR/all_urls_combined_raw.txt"
+    awk -F'?' '{
+        if ($2) { n=split($2,a,"&"); line=$1"?"; for(i=1;i<=n;i++){ split(a[i],kv,"="); line=line kv[1] (i<n?"&":"") }; print line }
+        else print $1
+    }' "$OUTDIR/all_urls_combined_raw.txt" | sort -u > "$OUTDIR/all_urls_normalized.txt"
+    ok "URL gabungan setelah normalize+dedup: $(cat "$OUTDIR/all_urls_normalized.txt" 2>/dev/null | wc -l) (dari $(cat "$OUTDIR/all_urls_combined_raw.txt" 2>/dev/null | wc -l) mentah)"
+else
+    warn "katana tidak tersedia, skip JS/endpoint mining"
+fi
+
+# ---------- STAGE 7: PARAMETER DISCOVERY ----------
+stage "Parameter discovery (arjun)"
+if command -v arjun &>/dev/null && [[ -s "$OUTDIR/live_hosts_only.txt" ]]; then
+    head -n 15 "$OUTDIR/live_hosts_only.txt" > "$OUTDIR/arjun_targets.txt"
+    arjun -i "$OUTDIR/arjun_targets.txt" -oT "$OUTDIR/arjun_results.txt" -t 5 --rate-limit "$HTTPX_RATE" &>/dev/null
+    if [[ -s "$OUTDIR/arjun_results.txt" ]]; then
+        ok "Parameter discovery selesai -> $OUTDIR/arjun_results.txt (15 host teratas)"
+    else
+        warn "Arjun tidak menemukan parameter baru"
+    fi
+else
+    warn "arjun tidak tersedia atau tidak ada live host, skip"
+fi
+
+# ---------- STAGE 8: JOIN HASIL PROSES PARALEL (takeover check + secret scan) ----------
+stage "Join hasil takeover check + JS secret scan (proses paralel)"
+if [[ -n "${TAKEOVER_PID:-}" ]]; then
+    log "Menunggu proses takeover check (Subdominator+subzy+nuclei+subjack+tko-subs+dnsReaper) selesai kalau masih jalan..."
+    wait "$TAKEOVER_PID" 2>/dev/null
+    TAKEOVER_COUNT=$(cat "$OUTDIR/takeover_candidates.txt" 2>/dev/null | wc -l)
+    if [[ "$TAKEOVER_COUNT" -gt 0 ]]; then
+        ok "Takeover check selesai -> $OUTDIR/takeover_candidates.txt ($TAKEOVER_COUNT baris kandidat, cek manual di $OUTDIR/takeover/*.txt per-tool)"
+    else
+        ok "Takeover check selesai -> tidak ada kandidat takeover yang terdeteksi dari tools yang tersedia"
+    fi
+    # Diagnostic: tool mana yang GAK menghasilkan file sama sekali (kemungkinan gagal jalan, bukan cuma "gak nemu apa-apa")
+    if [[ -x "$STRATUS_SUBDOMINATOR_BIN" && ! -f "$OUTDIR/takeover/stratus-subdominator_raw.txt" ]]; then
+        warn "  -> Subdominator (Stratus-Security) terinstall tapi GAK menghasilkan output sama sekali — cek $OUTDIR/tool_errors_takeover.log bagian [takeover] Subdominator"
+    fi
+    for tf in subzy_raw.txt nuclei_raw.txt subjack_raw.txt tkosubs_raw.csv dnsreaper_raw.json; do
+        tool_name="${tf%_raw*}"
+        if command -v "$tool_name" &>/dev/null && [[ ! -f "$OUTDIR/takeover/$tf" ]]; then
+            warn "  -> $tool_name terinstall tapi GAK menghasilkan output sama sekali — cek $OUTDIR/tool_errors_takeover.log bagian [takeover] $tool_name"
+        fi
+    done
+else
+    warn "Takeover check tidak dijalankan (gagal launch di background)"
+fi
+
+if [[ -n "${SECRETS_PID:-}" ]]; then
+    log "Menunggu proses JS secret scan (SecretFinder+trufflehog+nuclei) selesai kalau masih jalan..."
+    wait "$SECRETS_PID" 2>/dev/null
+    SECRETS_COUNT=$(cat "$OUTDIR/secrets_candidates.txt" 2>/dev/null | wc -l)
+    if [[ "$SECRETS_COUNT" -gt 0 ]]; then
+        ok "Secret scan selesai -> $OUTDIR/secrets_candidates.txt ($SECRETS_COUNT baris kandidat, cek manual di $OUTDIR/secrets/*.txt & js_dump/ per-tool — WASPADA FALSE POSITIVE)"
+    else
+        ok "Secret scan selesai -> tidak ada token/kredensial yang terdeteksi dari tools yang tersedia"
+    fi
+    if command -v nuclei &>/dev/null && [[ ! -s "$OUTDIR/secrets/nuclei_raw.txt" ]]; then
+        warn "  -> nuclei (secrets) hasilnya 0 byte — kemungkinan templates belum ke-update, cek: nuclei -update-templates"
+    fi
+
+    # Extract kandidat endpoint dari JS yang udah didownload run_secret_scan (js_dump/) - hindari download ulang
+    if [[ -d "$OUTDIR/js_dump" ]] && [[ -n "$(ls -A "$OUTDIR/js_dump" 2>/dev/null)" ]]; then
+        grep -hoE '"(/[a-zA-Z0-9_./-]{2,80})"' "$OUTDIR/js_dump"/*.js 2>/dev/null | tr -d '"' | sort -u > "$OUTDIR/js_endpoints.txt"
+        ok "Kandidat endpoint dari JS: $(cat "$OUTDIR/js_endpoints.txt" 2>/dev/null | wc -l) (review manual, dari $(ls "$OUTDIR/js_dump" | wc -l) JS file)"
+    else
+        touch "$OUTDIR/js_endpoints.txt"
+        warn "js_dump/ kosong — gak ada JS yang berhasil didownload, js_endpoints.txt jadi kosong"
+    fi
+else
+    warn "Secret scan tidak dijalankan (gagal launch di background / gak ada JS file)"
+fi
+
+# ---------- STAGE 9: SCREENSHOT ----------
+stage "Screenshot semua live host (gowitness)"
+if command -v gowitness &>/dev/null && [[ -n "$CHROME_BIN" ]]; then
+    mkdir -p "$OUTDIR/screenshots"
+    (cd "$OUTDIR" && gowitness scan file -f clean_urls_for_screenshot.txt --screenshot-path screenshots/ \
+        --chrome-path "$CHROME_BIN" --write-db --write-db-uri "sqlite://$(pwd)/gowitness.sqlite3" \
+        --threads "$HTTPX_THREADS" --log-scan-errors 2>/dev/null)
+    ok "Screenshot tersimpan di $OUTDIR/screenshots/"
+else
+    warn "gowitness/browser tidak tersedia, skip screenshot"
+fi
+
+# ---------- STAGE 10: SUMMARY REPORT ----------
+stage "Generate summary report"
+{
+    echo "# Recon Summary - $(date '+%Y-%m-%d %H:%M:%S')"
+    echo
+    echo "Scan mode    : $SCAN_MODE"
+    echo "Waktu mulai  : $(date -d "@$SCRIPT_START_EPOCH" '+%Y-%m-%d %H:%M:%S')"
+    echo "Waktu selesai: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "Total durasi : $(elapsed_since_start)"
+    echo "Target file  : $TARGET_FILE ($TARGET_COUNT domain)"
+    echo "Exclude file: $EXCLUDE_FILE ($( [[ -f "$EXCLUDE_FILE" ]] && grep -cve '^\s*$' "$EXCLUDE_FILE" || echo 0) pattern)"
+    echo
+    echo "## Angka Ringkas"
+    echo "- Subdomain hasil enum (in-scope) : $(cat "$OUTDIR/raw_subs.txt" 2>/dev/null | wc -l)"
+    echo "- Subdomain valid & resolve        : $(cat "$OUTDIR/resolved_subs.txt" 2>/dev/null | wc -l)"
+    echo "- Live host (semua port)           : $(cat "$OUTDIR/live_hosts.txt" 2>/dev/null | wc -l)"
+    echo "- Host non-404 (kandidat headless) : $(cat "$OUTDIR/interesting_hosts_all.txt" 2>/dev/null | wc -l)"
+    echo "- Katana static URLs               : $(cat "$OUTDIR/katana_static.txt" 2>/dev/null | wc -l)"
+    echo "- Katana headless URLs (tambahan)  : $(cat "$OUTDIR/katana_headless.txt" 2>/dev/null | wc -l)"
+    echo "- Historical URL (gau)             : $(cat "$OUTDIR/historical_urls.txt" 2>/dev/null | wc -l)"
+    echo "- URL dengan parameter             : $(cat "$OUTDIR/urls_with_params.txt" 2>/dev/null | wc -l)"
+    echo "- URL kemungkinan API              : $(cat "$OUTDIR/urls_api_like.txt" 2>/dev/null | wc -l)"
+    echo "- URL ekstensi sensitif            : $(cat "$OUTDIR/urls_sensitive_ext.txt" 2>/dev/null | wc -l)"
+    echo "- JS files ditemukan               : $(cat "$OUTDIR/js_files.txt" 2>/dev/null | wc -l)"
+    echo "- Kandidat endpoint dari JS        : $(cat "$OUTDIR/js_endpoints.txt" 2>/dev/null | wc -l)"
+    echo "- URL gabungan setelah dedup       : $(cat "$OUTDIR/all_urls_normalized.txt" 2>/dev/null | wc -l)"
+    echo "- Kandidat subdomain takeover      : $(cat "$OUTDIR/takeover_candidates.txt" 2>/dev/null | wc -l)"
+    echo "- Kandidat token/secret di JS       : $(cat "$OUTDIR/secrets_candidates.txt" 2>/dev/null | wc -l)"
+    echo "- AXFR zone transfer terbuka (ACTIVE) : $(( $(cat "$OUTDIR/axfr_results.txt" 2>/dev/null | grep -c 'TERBUKA') ))"
+    echo
+    echo "## Host dengan status code non-404/301 standar (worth di-review)"
+    grep -Ev '\[404( |\])|\[301' "$OUTDIR/live_hosts.txt" 2>/dev/null | head -30 || echo "(tidak ada data)"
+    echo
+    if [[ -s "$OUTDIR/axfr_results.txt" ]]; then
+        echo "## 🚨 ZONE TRANSFER (AXFR) TERBUKA — CRITICAL, laporkan segera!"
+        cat "$OUTDIR/axfr_results.txt"
+        echo
+    fi
+    if [[ -s "$OUTDIR/takeover_candidates.txt" ]]; then
+        echo "## ⚠️  KANDIDAT SUBDOMAIN TAKEOVER (PRIORITAS TINGGI, cek manual dulu sebelum lapor!)"
+        cat "$OUTDIR/takeover_candidates.txt"
+        echo
+    fi
+    if [[ -s "$OUTDIR/secrets_candidates.txt" ]]; then
+        echo "## ⚠️  KANDIDAT TOKEN/SECRET DI JS (PRIORITAS TINGGI, VERIFIKASI dulu — rawan false positive!)"
+        cat "$OUTDIR/secrets_candidates.txt"
+        echo
+    fi
+    echo "## Langkah Selanjutnya (manual, sesuai ROE program)"
+    echo "1. Review live_hosts.txt & screenshots/ -> pilih target prioritas"
+    echo "2. Review urls_sensitive_ext.txt, urls_api_like.txt, js_endpoints.txt manual"
+    echo "3. Cek arjun_results.txt utk parameter tersembunyi"
+    echo "4. Cek takeover_candidates.txt & takeover/*.txt manual -> verifikasi tiap kandidat SEBELUM submit (banyak false positive)"
+    echo "5. nuclei manual rate-limit rendah:"
+    echo "   nuclei -l $OUTDIR/live_hosts.txt -t exposures/,misconfiguration/ -rl 10 -o $OUTDIR/nuclei_results.txt"
+    echo "6. Fokus manual testing: business logic (race condition), IDOR, auth/OAuth flow"
+} > "$OUTDIR/report.md"
+ok "Summary report -> $OUTDIR/report.md"
+
+# Durasi stage 9 (report generation itu sendiri)
+NOW_EPOCH=$(date +%s)
+echo -e "[$(ts)] \033[1;35m[DURASI]\033[0m Stage $CURRENT_STAGE selesai dalam $(fmt_duration $(( NOW_EPOCH - LAST_STAGE_START )))"
+
+echo
+ok "=========================================="
+ok " RECON SELESAI — hasil di folder: $OUTDIR/"
+ok " Mulai   : $(date -d "@$SCRIPT_START_EPOCH" '+%Y-%m-%d %H:%M:%S')"
+ok " Selesai : $(date '+%Y-%m-%d %H:%M:%S')"
+ok " Total durasi proses: $(elapsed_since_start)"
+ok "=========================================="
+echo "  report.md                    : ringkasan hasil recon (baca ini duluan!)"
+echo "  live_hosts.txt               : host live + status code + tech stack (semua port)"
+echo "  interesting_hosts_all.txt    : host non-404 (kandidat paling menarik)"
+echo "  katana_static.txt            : hasil static crawl (-jc -kf all) semua host"
+echo "  katana_headless.txt          : hasil headless crawl (-hl) subset host non-404"
+echo "  katana_urls.txt              : gabungan static+headless, dedup"
+echo "  js_files.txt / js_endpoints.txt : JS files & kandidat endpoint (review manual!)"
+echo "  urls_with_params.txt / urls_api_like.txt / urls_sensitive_ext.txt"
+echo "  all_urls_normalized.txt      : semua URL gabungan, dedup"
+echo "  arjun_results.txt            : parameter discovery"
+echo "  takeover_candidates.txt      : kandidat subdomain takeover (gabungan Subdominator+subzy+nuclei+subjack+tko-subs+dnsReaper)"
+echo "  axfr_results.txt             : hasil zone transfer check (ACTIVE) - kalau ada isi, itu CRITICAL finding"
+echo "  wordlist_bruteforce.txt      : kandidat subdomain dari active wordlist bruteforce (SecLists)"
+echo "  takeover/                    : hasil mentah per-tool (buat verifikasi manual)"
+echo "  secrets_candidates.txt       : kandidat token/API key/credential di JS (gabungan SecretFinder+trufflehog+nuclei)"
+echo "  secrets/ & js_dump/          : hasil mentah per-tool & arsip JS yang di-download (buat verifikasi manual)"
+echo "  screenshots/                 : visual triage"
