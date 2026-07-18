@@ -1,6 +1,6 @@
 # rcon
 
-> A simple reconnaissance workflow for Bug Bounty, VDP, and Penetration Testing.
+> A simple Bash script that automates common reconnaissance tasks using existing open-source security tools.
 
 `rcon` is a Bash script that automates common reconnaissance tasks by combining multiple open-source security tools into a single workflow. Instead of running each tool manually, `rcon` executes them in sequence and stores the results in an organized directory structure.
 
